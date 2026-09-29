@@ -109,7 +109,7 @@ There is no filesystem move identity. Mark the old path missing and create new c
 
 A folder can be registered under a different spelling of the same location: letter case, an 8.3 short name, a junction, a `subst` drive, a `\\?\` prefix, or a symlink. The startup prune does not retire its rows. Instead it rewrites each row's folder part to today's spelling, and the row keeps its id and records. Every live row therefore carries the current spelling, and the per-root sync and the scan's dedupe stay exact-string comparisons.
 
-- **Case-only difference** (on a platform whose `normcase` folds case): the path is rewritten, with no filesystem access.
+- **Case-only difference** (on a platform whose `normcase` folds case): the path is rewritten once stat confirms the stored and current spellings of the folder are the same directory (device and inode). This costs one stat per distinct folder spelling. A case-sensitive directory (Windows can mark one; WSL creates them) can hold `output` and `Output` as different folders. Those rows are handled like any other unmatched row. If the folders can't be compared (a stat fails, or the filesystem reports inode 0), the row is left as it is.
 - **Any other difference:** a row is re-homed only if stat shows one of its ancestor directories is the same directory (device and inode) as an owned folder, and the file stats at the new path. A stat that fails, or a filesystem that reports inode 0, leaves the row to be retired as before.
 
 If a live row already holds the new path, the oldest row keeps it and the others are marked missing. This happens with duplicates left by an earlier case-only relaunch.

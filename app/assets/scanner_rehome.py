@@ -8,9 +8,11 @@ Every live row then carries today's exact spelling, which is what lets the
 per-root sync, the scan's existing-path dedupe and the live-path unique index
 stay exact-string comparisons.
 
-Two folders are the same only when stat says so (device and inode), and a row is
-re-homed only when its file stats at the new path. Anything undecided (a stat
-that fails, a filesystem reporting inode 0) is retired, as before.
+Two folders are the same only when stat says so (device and inode), including
+for a case-only difference: a case-sensitive directory on Windows (or one made by
+WSL) can hold ``output`` and ``Output`` side by side. A row that fails the text
+match is re-homed only when its file stats at the new path; anything undecided
+there (a stat that fails, a filesystem reporting inode 0) is retired, as before.
 """
 
 from __future__ import annotations
@@ -54,13 +56,14 @@ class PrunePlan(NamedTuple):
 class RespelledRow(NamedTuple):
     row: PruneRow
     new_path: str
+    prefix: str  # the owning prefix, as spelled today
 
 
 class CaseRespeller:
     """Maps a path to its folder part in the spelling of the deepest prefix it lies
-    under by the platform's case rules. Pure string: the prune already treats a
-    normcase match as the same folder. The prefixes are normalised once, since the
-    prune calls this for every live row."""
+    under by the platform's case rules. Pure string; plan_prune confirms the two
+    spellings are one folder before acting on it. The prefixes are normalised once,
+    since the prune calls this for every live row."""
 
     def __init__(self, prefixes: Sequence[str]):
         stems: list[tuple[str, str, str]] = []
@@ -74,13 +77,14 @@ class CaseRespeller:
         self._stems = stems
         self.folds_case = os.path.normcase("A") != "A"
 
-    def __call__(self, path: str) -> str | None:
-        """``path`` respelled, or None when no prefix contains it. Deepest prefix first,
-        so a row exactly under a shallow prefix is still respelled for a deeper one."""
+    def __call__(self, path: str) -> tuple[str, str] | None:
+        """(``path`` respelled, the prefix it lies under), or None when no prefix
+        contains it. Deepest prefix first, so a row exactly under a shallow prefix is
+        still respelled for a deeper one."""
         candidate = os.path.normcase(path)
         for prefix, folded, stem in self._stems:
             if candidate == folded or candidate.startswith(stem):
-                return prefix + path[len(prefix):]
+                return prefix + path[len(prefix):], prefix
         return None
 
 
@@ -147,6 +151,15 @@ class _FolderResolver:
             self._owners[walked] = found
         return found
 
+    def same_folder(self, first: str, second: str) -> bool | None:
+        """Whether two directories are one, by device and inode; None when a stat
+        fails or the filesystem reports no inode numbers."""
+        first_id = _identity(self.dir_stat(first))
+        second_id = _identity(self.dir_stat(second))
+        if first_id is None or second_id is None:
+            return None
+        return first_id == second_id
+
 
 def plan_prune(
     respelled: Iterable[RespelledRow],
@@ -159,11 +172,25 @@ def plan_prune(
     their deepest prefix, already paired with CaseRespeller's path. ``unowned`` rows
     fail the text match altogether.
     """
-    moves: list[tuple[PruneRow, str]] = [(r.row, r.new_path) for r in respelled]
+    moves: list[tuple[PruneRow, str]] = []
     retire: list[str] = []
     still_present = 0
-
     resolver = _FolderResolver(prefixes)
+
+    unowned = list(unowned)
+    for respelled_row in respelled:
+        row, prefix = respelled_row.row, respelled_row.prefix
+        # Stat'ed once per distinct stored spelling, so this costs per folder, not per row.
+        same = resolver.same_folder(row.path[:len(prefix)], prefix)
+        if same:
+            moves.append((row, respelled_row.new_path))
+        elif same is False:
+            # A case-sensitive directory: another folder that differs only in case.
+            # Treat the row as unowned; a real alias can still claim it.
+            unowned.append(row)
+        # Undecided (a stat failed, or no inode numbers): leave the row as it is, as
+        # the prune did before re-spelling existed.
+
     for row in unowned:
         parent = os.path.dirname(row.path)
         # A parent that cannot be stat'ed (an unplugged drive, an offline share) skips

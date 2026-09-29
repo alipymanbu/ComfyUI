@@ -328,9 +328,10 @@ def mark_contents_missing_outside_prefixes(
         if not is_owned(path):
             unowned.append(PruneRow(content_id, path, created_at))
         elif respell.folds_case:
-            new_path = respell(path)
-            if new_path is not None and new_path != path:
-                respelled.append(RespelledRow(PruneRow(content_id, path, created_at), new_path))
+            respelled_to = respell(path)
+            if respelled_to is not None and respelled_to[0] != path:
+                new_path, prefix = respelled_to
+                respelled.append(RespelledRow(PruneRow(content_id, path, created_at), new_path, prefix))
     # The plan only reads the filesystem, so no write is pending while it stats.
     plan = plan_prune(respelled, unowned, prefixes)
     return apply_prune_plan(session, plan)

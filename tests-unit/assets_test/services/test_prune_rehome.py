@@ -378,13 +378,15 @@ def test_of_two_aliases_for_one_file_the_older_row_moves(session, temp_dir):
 def test_case_respelling_uses_the_deepest_matching_prefix(folds_case):
     respell = CaseRespeller(["/Data", "/Data/Output"])
 
-    assert respell("/data/output/sub/F.png") == "/Data/Output/sub/F.png"
-    assert respell("/data/other/F.png") == "/Data/other/F.png"
+    assert respell("/data/output/sub/F.png") == ("/Data/Output/sub/F.png", "/Data/Output")
+    assert respell("/data/other/F.png") == ("/Data/other/F.png", "/Data")
     assert respell("/elsewhere/F.png") is None
 
 
 def test_a_row_spelled_for_a_shallow_prefix_is_respelled_for_a_deeper_one(folds_case, session, temp_dir):
     shallow = temp_dir / "models"
+    (shallow / "output").mkdir(parents=True)
+    _case_variant(shallow / "output", shallow / "Output")
     row = _row(session, shallow / "output" / "f.png")
 
     result = mark_contents_missing_outside_prefixes(session, [str(shallow), str(shallow / "Output")])
@@ -401,3 +403,76 @@ def test_without_case_folding_owned_rows_are_left_alone(session, temp_dir):
 
     assert (result.marked, result.rehomed) == (0, 0)
     assert _live(session, row.content_id) == str(shallow / "output" / "f.png")
+
+
+def _folds_case_on_disk(directory: Path) -> bool:
+    probe = directory / "case-probe"
+    probe.mkdir()
+    try:
+        return (directory / "CASE-PROBE").exists()
+    finally:
+        probe.rmdir()
+
+
+def test_a_case_sensitive_sibling_folder_is_not_mistaken_for_the_same_one(
+    folders, folds_case, temp_dir, session, caplog
+):
+    """Windows can mark a directory case-sensitive (WSL does), so output and Output
+    are different folders even where paths are compared case-insensitively."""
+    if _folds_case_on_disk(temp_dir):
+        pytest.skip("this filesystem cannot hold two names differing only in case")
+    lower = temp_dir / "cs" / "output"
+    upper = temp_dir / "cs" / "Output"
+    _populate(lower, OUTPUT_FILES)
+    _populate(upper, OUTPUT_FILES)  # same names and sizes, different files
+    folders.use(output=lower, models=None)
+    _boot()
+    _rename_all(session)
+    old_ids = set(_records(session))
+
+    folders.use(output=upper, models=None)
+
+    assert _boot(caplog) == len(OUTPUT_FILES)
+    assert not old_ids & set(_records(session))
+    assert _missing_count(session) == len(OUTPUT_FILES)
+    event = _marked_missing_event(caplog)
+    assert event["rehomed_count"] == "0"
+    assert event["still_present_count"] == str(len(OUTPUT_FILES))
+
+
+def test_a_case_respelling_whose_folders_cannot_be_compared_is_left_alone(folds_case, session, temp_dir):
+    stored = temp_dir / "offline" / "output"
+    row = _row(session, stored / "f.png")
+
+    result = mark_contents_missing_outside_prefixes(session, [str(temp_dir / "Offline" / "output")])
+
+    assert result == (0, 0, 0, 0)
+    assert _live(session, row.content_id) == str(stored / "f.png")
+
+
+def test_an_unreachable_folder_is_probed_once_then_never_again(session, temp_dir, monkeypatch):
+    """Retired rows are not live, and the prune selects only live rows, so a folder on
+    an unreachable host costs its timeout on one startup only."""
+    gone = temp_dir / "unreachable-host" / "output"
+    rows = [_row(session, gone / "f.png"), _row(session, gone / "g.png")]
+    owned = [str(temp_dir / "output")]
+    real_stat = os.stat
+    probed: list[str] = []
+
+    def unreachable(path, *args, **kwargs):
+        if os.fspath(path).startswith(str(temp_dir / "unreachable-host")):
+            probed.append(os.fspath(path))
+            raise OSError(53, "network path not found")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", unreachable)
+
+    first = mark_contents_missing_outside_prefixes(session, owned)
+    session.commit()
+    first_probes = len(probed)
+    second = mark_contents_missing_outside_prefixes(session, owned)
+
+    assert first.marked == len(rows)
+    assert first_probes == 1  # the shared parent, once
+    assert second == (0, 0, 0, 0)
+    assert len(probed) == first_probes
