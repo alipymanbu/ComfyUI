@@ -503,6 +503,7 @@ class _AssetSeeder:
                 rehomed_count=result.rehomed,
                 still_present_count=result.still_present,
                 conflict_retired_count=result.conflict_retired,
+                merged_records_count=result.merged_records,
                 stage=_ScanStage.MARK_MISSING.value,
             )
             _log_prune(result)
@@ -660,6 +661,7 @@ class _AssetSeeder:
                         rehomed_count=result.rehomed,
                         still_present_count=result.still_present,
                         conflict_retired_count=result.conflict_retired,
+                        merged_records_count=result.merged_records,
                         stage=_ScanStage.PRUNING.value,
                     )
                     _log_prune(result)

@@ -64,6 +64,7 @@ class PruneResult(NamedTuple):
     rehomed: int  # rows rewritten to today's spelling of their folder
     still_present: int  # retired rows whose file still stats
     conflict_retired: int  # retired because an older row holds the same path
+    merged_records: int = 0  # records moved from a retired duplicate onto the kept row
 
 
 class PruneRow(NamedTuple):
@@ -438,6 +439,44 @@ class _RoleDeriver:
         )
 
 
+def _move_records_with_history(
+    session: Session, kept_for: dict[str, tuple[str, str]], role_of: _RoleDeriver
+) -> int:
+    """Re-point the records of each retired duplicate that carry history onto the
+    content that keeps the path. Nothing is merged field by field: a content may
+    hold several records (a cached output adds one per delivery), and each keeps its
+    own name, tags, job and metadata. An untouched scan stub stays behind, so the
+    file is not listed twice for nothing."""
+    moved = 0
+    for chunk in _batches(list(kept_for)):
+        records = session.execute(
+            sa.select(
+                Asset.id, Asset.content_id, Asset.name, Asset.job_id, Asset.user_metadata, Asset.preview_id
+            ).where(Asset.content_id.in_(chunk))
+        ).all()
+        tags: dict[str, set[str]] = {}
+        for record_chunk in _batches([record.id for record in records]):
+            for record_id, tag_name in session.execute(
+                sa.select(AssetTag.asset_id, AssetTag.tag_name).where(AssetTag.asset_id.in_(record_chunk))
+            ):
+                tags.setdefault(record_id, set()).add(tag_name)
+        for record in records:
+            winner_id, path = kept_for[record.content_id]
+            derived = role_of(path)
+            derived_tags = derived[0] if derived is not None else frozenset()
+            has_history = (
+                record.job_id is not None
+                or bool(record.user_metadata)
+                or record.preview_id is not None
+                or record.name != os.path.basename(path)
+                or bool(tags.get(record.id, set()) - derived_tags)
+            )
+            if has_history:
+                session.execute(sa.update(Asset).where(Asset.id == record.id).values(content_id=winner_id))
+                moved += 1
+    return moved
+
+
 def _live_occupants(session: Session, paths: Sequence[str]) -> dict[str, PruneRow]:
     occupants: dict[str, PruneRow] = {}
     for chunk in _batches(list(paths)):
@@ -477,9 +516,10 @@ def apply_prune_plan(session: Session, plan: PrunePlan) -> PruneResult:
 
     A row re-homes to its first candidate in its own role, or is retired if it has
     none. Where a new path is already held by a live row (a duplicate made under
-    another spelling), or two rows move to one path, the oldest row keeps it, since
-    it carries the user's history, and the others are retired: marked missing,
-    never deleted.
+    another spelling), or two rows move to one path, the oldest row keeps it and the
+    others are retired: marked missing, never deleted. Records on a retired
+    duplicate that carry history (a job, user metadata, a preview, a rename, a tag
+    of their own) move to the kept row first; only untouched scan stubs stay behind.
     """
     retire = list(plan.retire)
     still_present = plan.still_present
@@ -501,14 +541,20 @@ def apply_prune_plan(session: Session, plan: PrunePlan) -> PruneResult:
     occupants = _live_occupants(session, list(by_target))
     rewrites: list[dict[str, str]] = []
     losers: list[str] = []
+    kept_for: dict[str, tuple[str, str]] = {}  # loser content id -> (winner content id, path)
     for new_path, rows in by_target.items():
         occupant = occupants.get(new_path)
         contenders = rows if occupant is None else [*rows, occupant]
         winner = min(contenders, key=lambda row: (row.created_at, row.content_id))
-        losers.extend(row.content_id for row in contenders if row is not winner)
+        for row in contenders:
+            if row is not winner:
+                losers.append(row.content_id)
+                kept_for[row.content_id] = (winner.content_id, new_path)
         if winner is not occupant:
             rewrites.append({"id": winner.content_id, "path": new_path})
 
+    # Before retiring, so the records that move are not tagged missing with the rest.
+    merged = _move_records_with_history(session, kept_for, role_of)
     # Retire first: a loser may hold the path its winner is about to take.
     for content_id in [*retire, *losers]:
         mark_content_missing(session, content_id)
@@ -519,4 +565,5 @@ def apply_prune_plan(session: Session, plan: PrunePlan) -> PruneResult:
         rehomed=rehomed,
         still_present=still_present,
         conflict_retired=len(losers),
+        merged_records=merged,
     )

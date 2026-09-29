@@ -38,6 +38,7 @@ VALID_VALUES: dict[str, list[object]] = {
     "rehomed_count": [0, 77252],
     "still_present_count": [0, 3],
     "conflict_retired_count": [0, 2],
+    "merged_records_count": [0, 5],
     "error_type": ["ValueError", "FileNotFoundError"],
     "hashing_enabled": [True, False],
     "site": ["discovery", "enrich"],

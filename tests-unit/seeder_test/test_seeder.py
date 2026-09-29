@@ -508,6 +508,7 @@ def test_prune_before_scan_emits_marked_missing_with_pruning_stage(
             "rehomed_count": 0,
             "still_present_count": 0,
             "conflict_retired_count": 0,
+            "merged_records_count": 0,
             "stage": "pruning",
         }
     ]
@@ -534,6 +535,7 @@ def test_standalone_mark_missing_emits_count_with_mark_missing_stage(
             "rehomed_count": 0,
             "still_present_count": 0,
             "conflict_retired_count": 0,
+            "merged_records_count": 0,
             "stage": "mark_missing",
         }
     ]

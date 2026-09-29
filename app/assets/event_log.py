@@ -93,6 +93,7 @@ ALLOWED_FIELDS: dict[str, Callable[[Any], bool]] = {
     "rehomed_count": _is_count,
     "still_present_count": _is_count,
     "conflict_retired_count": _is_count,
+    "merged_records_count": _is_count,
     "error_type": _is_safe_string,
     "hashing_enabled": _is_flag,
     "site": _one_of(STAT_SITES),

@@ -20,7 +20,13 @@ from sqlalchemy.orm import Session as SASession, sessionmaker
 import folder_paths
 from app.assets import scanner_rehome, seeder as seeder_module
 from app.assets.database.models import Asset, AssetContent
-from app.assets.database.queries.records import create_content, create_record
+from app.assets.database.queries.records import (
+    create_content,
+    create_record,
+    ensure_tag,
+    ensure_tag_link,
+    fetch_record_tags,
+)
 from app.assets.scanner_admission import _WATCH_LIST
 from app.assets.scanner import mark_contents_missing_outside_prefixes
 from app.assets.scanner_rehome import (
@@ -184,6 +190,7 @@ def test_output_seeded_through_a_symlink_keeps_its_records_when_booted_by_the_re
         "rehomed_count": str(len(OUTPUT_FILES)),
         "still_present_count": "0",
         "conflict_retired_count": "0",
+        "merged_records_count": "0",
         "stage": "pruning",
     }
 
@@ -261,7 +268,13 @@ def test_existing_case_duplicates_heal_keeping_the_older_row(folders, folds_case
     for name in OUTPUT_FILES:
         content = create_content(session, path=str(real / name), size_bytes=1, mtime_ns=1)
         content.created_at = later
-        create_record(session, content_id=content.id, name="duplicate")
+        create_record(
+            session,
+            content_id=content.id,
+            name=os.path.basename(name),
+            loader_path=name.replace(os.sep, "/"),
+            tags=["output"],
+        )  # an untouched scan stub
     session.commit()
 
     folders.use(output=real, models=None)
@@ -453,7 +466,7 @@ def test_a_case_respelling_whose_folders_cannot_be_compared_is_left_alone(folds_
 
     result = mark_contents_missing_outside_prefixes(session, [str(temp_dir / "Offline" / "output")])
 
-    assert result == (0, 0, 0, 0)
+    assert result == (0, 0, 0, 0, 0)
     assert _live(session, row.content_id) == str(stored / "f.png")
 
 
@@ -481,7 +494,7 @@ def test_an_unreachable_folder_is_probed_once_then_never_again(session, temp_dir
 
     assert first.marked == len(rows)
     assert first_probes == 1  # the shared parent, once
-    assert second == (0, 0, 0, 0)
+    assert second == (0, 0, 0, 0, 0)
     assert len(probed) == first_probes
 
 
@@ -606,3 +619,71 @@ def test_a_target_taken_by_a_racing_writer_skips_that_row_only(folders, session,
     assert _live(session, raced.content_id) == str(alias / "f.png")
     assert _live(session, moved.content_id) == str(real / "g.png")
     assert _live(session, racer.content_id) == str(real / "f.png")
+
+
+# --- healing a duplicate keeps the newer row's history ------------------------------------
+
+def _duplicate_pair(folders, session, temp_dir: Path) -> tuple[PruneRow, PruneRow]:
+    """An older row under an alias spelling and a newer live duplicate at today's."""
+    real = temp_dir / "real"
+    _populate(real, ("f.png",))
+    folders.use(output=real, models=None)
+    older = _row(session, _alias(real, temp_dir / "alias") / "f.png", age_days=0)
+    newer = _row(session, real / "f.png", age_days=1)
+    return older, newer
+
+
+def _record_of(session, content_id: str) -> Asset:
+    return session.scalars(sa.select(Asset).where(Asset.content_id == content_id)).one()
+
+
+def _records_on(session, content_id: str) -> set[str]:
+    session.expire_all()
+    return set(session.scalars(sa.select(Asset.id).where(Asset.content_id == content_id)))
+
+
+def _tag(session, record_id: str, tag: str) -> None:
+    ensure_tag(session, tag)
+    ensure_tag_link(session, asset_id=record_id, tag_name=tag, origin="manual")
+
+
+def test_both_duplicates_keep_their_tags_and_job_links_on_the_kept_row(folders, session, temp_dir):
+    older, newer = _duplicate_pair(folders, session, temp_dir)
+    older_record, newer_record = _record_of(session, older.content_id), _record_of(session, newer.content_id)
+    older_record.job_id, newer_record.job_id = "job-old", "job-new"
+    _tag(session, older_record.id, "old-tag")
+    _tag(session, newer_record.id, "new-tag")
+    session.flush()
+
+    result = mark_contents_missing_outside_prefixes(session, [str(temp_dir / "real")])
+
+    assert (result.rehomed, result.conflict_retired, result.merged_records) == (1, 1, 1)
+    assert _live(session, older.content_id) == str(temp_dir / "real" / "f.png")
+    assert _live(session, newer.content_id) is None
+    assert _records_on(session, older.content_id) == {older_record.id, newer_record.id}
+    assert {"new-tag", "output"} <= set(fetch_record_tags(session, newer_record.id))
+    assert "missing" not in fetch_record_tags(session, newer_record.id)
+    assert session.get(Asset, newer_record.id).job_id == "job-new"
+
+
+def test_an_untouched_scan_stub_on_the_newer_duplicate_stays_retired(folders, session, temp_dir):
+    older, newer = _duplicate_pair(folders, session, temp_dir)
+    stub = _record_of(session, newer.content_id)
+
+    result = mark_contents_missing_outside_prefixes(session, [str(temp_dir / "real")])
+
+    assert (result.conflict_retired, result.merged_records) == (1, 0)
+    assert _records_on(session, newer.content_id) == {stub.id}
+    assert "missing" in fetch_record_tags(session, stub.id)
+
+
+def test_a_newer_record_with_only_a_user_tag_moves(folders, session, temp_dir):
+    older, newer = _duplicate_pair(folders, session, temp_dir)
+    record = _record_of(session, newer.content_id)
+    _tag(session, record.id, "favourite")
+    session.flush()
+
+    result = mark_contents_missing_outside_prefixes(session, [str(temp_dir / "real")])
+
+    assert result.merged_records == 1
+    assert record.id in _records_on(session, older.content_id)
