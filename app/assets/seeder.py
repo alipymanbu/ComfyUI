@@ -16,6 +16,7 @@ from typing import Any, Callable, TypedDict
 
 from app.assets.event_log import emit, error_type
 from app.assets.scanner import (
+    PruneResult,
     RootType,
     build_asset_specs,
     collect_paths_for_roots,
@@ -124,6 +125,16 @@ class _ScanState:
             return False
         self._emitted_keys.add(key)
         return True
+
+
+def _log_prune(result: PruneResult) -> None:
+    if result.marked > 0:
+        logging.info("Marked %d references as missing", result.marked)
+    if result.rehomed > 0:
+        logging.info(
+            "Kept %d references whose folder is registered under a new spelling",
+            result.rehomed,
+        )
 
 
 def _snapshot_progress(state: _ScanState) -> Progress:
@@ -483,17 +494,19 @@ class _AssetSeeder:
                 return 0
 
             all_prefixes = get_owned_prefixes()
-            marked = mark_missing_outside_prefixes_safely(all_prefixes)
-            if marked is None:
+            result = mark_missing_outside_prefixes_safely(all_prefixes)
+            if result is None:
                 return None
             emit(
                 "seeder.marked_missing",
-                count=marked,
+                count=result.marked,
+                rehomed_count=result.rehomed,
+                still_present_count=result.still_present,
+                conflict_retired_count=result.conflict_retired,
                 stage=_ScanStage.MARK_MISSING.value,
             )
-            if marked > 0:
-                logging.info("Marked %d references as missing", marked)
-            return marked
+            _log_prune(result)
+            return result.marked
         finally:
             with self._lock:
                 self._reset_to_idle()
@@ -635,22 +648,21 @@ class _AssetSeeder:
 
             if self._prune_first:
                 all_prefixes = get_owned_prefixes()
-                marked = mark_missing_outside_prefixes_safely(all_prefixes)
-                marked_count = 0 if marked is None else marked
-                if marked is None:
+                result = mark_missing_outside_prefixes_safely(all_prefixes)
+                if result is None:
                     self._add_error(
                         "Marking missing assets failed; scan continued without pruning"
                     )
                 else:
                     emit(
                         "seeder.marked_missing",
-                        count=marked_count,
+                        count=result.marked,
+                        rehomed_count=result.rehomed,
+                        still_present_count=result.still_present,
+                        conflict_retired_count=result.conflict_retired,
                         stage=_ScanStage.PRUNING.value,
                     )
-                if marked_count > 0:
-                    logging.info(
-                        "Marked %d refs as missing before scan", marked_count
-                    )
+                    _log_prune(result)
                 sync_temp_references_safely(scan_state)
 
             if self._check_pause_and_cancel(_ScanStage.PRUNING):

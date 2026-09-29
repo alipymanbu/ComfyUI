@@ -45,9 +45,12 @@ def sql_path_under_prefix(
     )
 
 
-def path_prefix_matcher(prefixes: Iterable[str]) -> Callable[[str], bool]:
+def path_prefix_matcher(
+    prefixes: Iterable[str], *, fold_case: bool = True
+) -> Callable[[str], bool]:
     """Return ``path -> Path(path).is_relative_to(<any prefix>)``, with the prefixes
-    normalized once.
+    normalized once. ``fold_case=False`` compares the spelling exactly, even where
+    the platform folds case.
 
     The startup prune tests every catalogued row against every owned prefix, and
     ``Path.is_relative_to`` walks the path's parents on each call, so a pathlib
@@ -58,17 +61,18 @@ def path_prefix_matcher(prefixes: Iterable[str]) -> Callable[[str], bool]:
     # anchor of its own: "//server/f" is not under "/". Such paths are only matched
     # against prefixes with the same anchor.
     double = os.sep * 2
+    normcase = os.path.normcase if fold_case else str
     exact: dict[bool, set[str]] = {False: set(), True: set()}
     stems: dict[bool, list[str]] = {False: [], True: []}
     for prefix in prefixes:
-        base = os.path.normcase(os.path.abspath(prefix))
+        base = normcase(os.path.abspath(prefix))
         is_double = base.startswith(double)
         exact[is_double].add(base)
         stems[is_double].append(base if base.endswith(os.sep) else base + os.sep)
     stem_tuples = {key: tuple(value) for key, value in stems.items()}
 
     def matches(path: str) -> bool:
-        candidate = os.path.normcase(os.path.abspath(path))
+        candidate = normcase(os.path.abspath(path))
         is_double = candidate.startswith(double)
         return candidate in exact[is_double] or candidate.startswith(stem_tuples[is_double])
 

@@ -38,6 +38,12 @@ from app.assets.scanner_changes import (
     pending_recovery_count,
     recover_missing_content,
 )
+from app.assets.scanner_rehome import (
+    PruneResult,
+    PruneRow,
+    apply_prune_plan,
+    plan_prune,
+)
 from app.assets.scanner_admission import (
     PARTIAL_DOWNLOAD_EXTENSIONS as PARTIAL_DOWNLOAD_EXTENSIONS,
     _WATCH_LIST as _WATCH_LIST,
@@ -283,17 +289,18 @@ def sync_temp_references_safely(
         )
 
 
-def mark_missing_outside_prefixes_safely(prefixes: list[str]) -> int | None:
-    """Mark references as missing when outside the given prefixes.
+def mark_missing_outside_prefixes_safely(prefixes: list[str]) -> PruneResult | None:
+    """Mark references as missing when outside the given prefixes, re-homing the
+    ones whose folder is owned under another spelling (see scanner_rehome).
 
-    This is a non-destructive soft-delete. Returns the count marked, or None when
-    the operation fails.
+    This is a non-destructive soft-delete. Returns the outcome, or None when the
+    operation fails.
     """
     try:
         with create_session() as sess:
-            count = mark_contents_missing_outside_prefixes(sess, prefixes)
+            result = mark_contents_missing_outside_prefixes(sess, prefixes)
             sess.commit()
-            return count
+            return result
     except Exception as exc:
         logging.exception("marking missing assets failed: %s", exc)
         emit(
@@ -305,17 +312,24 @@ def mark_missing_outside_prefixes_safely(prefixes: list[str]) -> int | None:
 
 def mark_contents_missing_outside_prefixes(
     session: Session, prefixes: list[str]
-) -> int:
-    contents = session.scalars(
-        sa.select(AssetContent)
+) -> PruneResult:
+    rows = session.execute(
+        sa.select(AssetContent.id, AssetContent.path, AssetContent.created_at)
         .where(AssetContent.is_missing.is_(False))
         .execution_options(yield_per=500)
     )
     is_owned = path_prefix_matcher(prefixes)
-    missing = [content for content in contents if not is_owned(content.path)]
-    for content in missing:
-        mark_content_missing(session, content.id)
-    return len(missing)
+    is_spelled = path_prefix_matcher(prefixes, fold_case=False)
+    respelled: list[PruneRow] = []
+    unowned: list[PruneRow] = []
+    for content_id, path, created_at in rows:
+        if not is_owned(path):
+            unowned.append(PruneRow(content_id, path, created_at))
+        elif not is_spelled(path):
+            respelled.append(PruneRow(content_id, path, created_at))
+    # The plan only reads the filesystem, so no write is pending while it stats.
+    plan = plan_prune(respelled, unowned, prefixes)
+    return apply_prune_plan(session, plan)
 
 
 def collect_paths_for_roots(roots: tuple[RootType, ...]) -> list[str]:
