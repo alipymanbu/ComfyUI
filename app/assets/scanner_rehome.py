@@ -35,7 +35,7 @@ import stat
 import threading
 import time
 from collections.abc import Callable, Iterable, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import NamedTuple
 
 import sqlalchemy as sa
@@ -99,10 +99,14 @@ class CaseRespeller:
 
     def __init__(self, prefixes: Sequence[str]):
         stems: list[tuple[str, str, str]] = []
-        for prefix in {os.path.abspath(p) for p in prefixes}:
+        seen: set[str] = set()
+        # Registration order, not a set: of two prefixes that differ only in case, the
+        # first registered wins every launch, rather than the rows flipping between them.
+        for prefix in dict.fromkeys(os.path.abspath(p) for p in prefixes):
             folded = os.path.normcase(prefix)
-            if len(folded) != len(prefix):  # case mapping changed the length: no safe splice
+            if len(folded) != len(prefix) or folded in seen:  # a length change: no safe splice
                 continue
+            seen.add(folded)
             stem = folded if folded.endswith(os.sep) else folded + os.sep
             stems.append((prefix, folded, stem))
         stems.sort(key=lambda entry: len(entry[0]), reverse=True)
@@ -375,6 +379,10 @@ def plan_prune(
 
 _RecordRole = tuple[str | None, frozenset[str]]  # (loader_path, tags)
 
+# updated_at moves only on an explicit user edit (rename, metadata, MIME type, preview,
+# tags). At creation it and created_at are separate defaults, microseconds apart.
+_EDITED_AFTER = timedelta(seconds=1)
+
 
 def _batches(items: Sequence, size: int = _BATCH) -> Iterable[Sequence]:
     for start in range(0, len(items), size):
@@ -451,7 +459,14 @@ def _move_records_with_history(
     for chunk in _batches(list(kept_for)):
         records = session.execute(
             sa.select(
-                Asset.id, Asset.content_id, Asset.name, Asset.job_id, Asset.user_metadata, Asset.preview_id
+                Asset.id,
+                Asset.content_id,
+                Asset.name,
+                Asset.job_id,
+                Asset.user_metadata,
+                Asset.preview_id,
+                Asset.created_at,
+                Asset.updated_at,
             ).where(Asset.content_id.in_(chunk))
         ).all()
         tags: dict[str, set[str]] = {}
@@ -466,8 +481,9 @@ def _move_records_with_history(
             derived_tags = derived[0] if derived is not None else frozenset()
             has_history = (
                 record.job_id is not None
-                or bool(record.user_metadata)
+                or record.user_metadata is not None
                 or record.preview_id is not None
+                or record.updated_at - record.created_at > _EDITED_AFTER
                 or record.name != os.path.basename(path)
                 or bool(tags.get(record.id, set()) - derived_tags)
             )

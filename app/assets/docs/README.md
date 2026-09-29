@@ -112,7 +112,7 @@ A folder can be registered under a different spelling of the same location: lett
 - **Case-only difference** (on a platform whose `normcase` folds case): the path is rewritten once stat confirms the stored and current spellings of the folder are the same directory (device and inode). This costs one stat per distinct folder spelling. A case-sensitive directory (Windows can mark one; WSL creates them) can hold `output` and `Output` as different folders. Those rows are handled like any other unmatched row. If the folders can't be compared (a stat fails, or the filesystem reports inode 0), the row is left as it is.
 - **Any other difference:** a row is re-homed only if stat shows one of its ancestor directories is the same directory (device and inode) as an owned folder, and the file stats at the new path. A stat that fails, or a filesystem that reports inode 0, leaves the row to be retired as before.
 
-If a live row already holds the new path, the oldest row keeps it and the others are marked missing. This happens with duplicates left by an earlier case-only relaunch. Before a duplicate is retired, its records that carry history (a job, user metadata, a preview, a rename, or a tag beyond the path-derived ones) are moved onto the kept row, each keeping its own fields. Only untouched scan stubs stay on the retired duplicate.
+If a live row already holds the new path, the oldest row keeps it and the others are marked missing. This happens with duplicates left by an earlier case-only relaunch. Before a duplicate is retired, its records that carry history (a job, user metadata, a preview, a rename, a tag beyond the path-derived ones, or any other explicit edit) are moved onto the kept row, each keeping its own fields. Only untouched scan stubs stay on the retired duplicate.
 
 A re-homed row keeps the tags it was given when it was first catalogued, as a row whose spelling never changed does, even if the folder now plays a different role. Case-only rewrites don't check that the file exists; the per-root sync that follows retires the row if it doesn't.
 
@@ -132,7 +132,7 @@ The scanner follows symlinks, stores lexical paths, and applies an inode cycle g
 
 ### Case and Unicode path forms
 
-Store absolute, structurally normalised paths: relative segments and repeated separators collapse at the write boundary, so every stored path is the lexical absolute form. Never canonicalize case or Unicode; compare byte-for-byte. Filesystems that treat two case or Unicode spellings as the same path may therefore produce duplicate rows.
+Store absolute, structurally normalised paths: relative segments and repeated separators collapse at the write boundary, so every stored path is the lexical absolute form. Writes and scans never canonicalize case or Unicode; they compare byte-for-byte. The one exception is a registered folder's own spelling: the startup prune rewrites a row's folder part to it (see "Folder registered under a different spelling"). Below that folder, filesystems that treat two case or Unicode spellings as the same path may still produce duplicate rows.
 
 ### Registry changes
 

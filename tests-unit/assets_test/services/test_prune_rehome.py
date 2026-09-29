@@ -687,3 +687,26 @@ def test_a_newer_record_with_only_a_user_tag_moves(folders, session, temp_dir):
 
     assert result.merged_records == 1
     assert record.id in _records_on(session, older.content_id)
+
+
+@pytest.mark.parametrize("edit", ["mime_type", "cleared_metadata"])
+def test_a_newer_record_with_any_explicit_edit_moves(folders, session, temp_dir, edit):
+    older, newer = _duplicate_pair(folders, session, temp_dir)
+    record = _record_of(session, newer.content_id)
+    if edit == "mime_type":
+        record.mime_type = "image/webp"
+        record.updated_at = record.created_at + timedelta(minutes=5)
+    else:
+        record.user_metadata = {}
+    session.flush()
+
+    result = mark_contents_missing_outside_prefixes(session, [str(temp_dir / "real")])
+
+    assert result.merged_records == 1
+    assert record.id in _records_on(session, older.content_id)
+
+
+def test_of_two_prefixes_differing_only_in_case_the_first_registered_wins(folds_case):
+    for prefixes in (["/Data/Out", "/data/out"], ["/data/out", "/Data/Out"]):
+        respell = CaseRespeller(prefixes)
+        assert respell("/DATA/OUT/f.png") == (prefixes[0] + "/f.png", prefixes[0])
