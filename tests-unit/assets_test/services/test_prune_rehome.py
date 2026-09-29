@@ -398,15 +398,15 @@ def test_of_two_aliases_for_one_file_the_older_row_moves(folders, session, temp_
 def test_case_respelling_uses_the_deepest_matching_prefix(folds_case):
     respell = CaseRespeller(["/Data", "/Data/Output"])
 
-    assert respell("/data/output/sub/F.png") == ("/Data/Output/sub/F.png", "/Data/Output")
-    assert respell("/data/other/F.png") == ("/Data/other/F.png", "/Data")
+    assert respell("/data/output/sub/F.png") == (("/Data/Output/sub/F.png", "/Data/Output"),)
+    assert respell("/data/other/F.png") == (("/Data/other/F.png", "/Data"),)
     assert respell("/elsewhere/F.png") is None
 
 
-def test_a_row_spelled_for_a_shallow_prefix_is_respelled_for_a_deeper_one(folds_case, session, temp_dir):
+def test_a_row_spelled_for_a_shallow_prefix_is_respelled_for_a_deeper_one(folders, folds_case, session, temp_dir):
     shallow = temp_dir / "models"
     (shallow / "output").mkdir(parents=True)
-    _case_variant(shallow / "output", shallow / "Output")
+    folders.use(output=_case_variant(shallow / "output", shallow / "Output"), models=None)
     row = _row(session, shallow / "output" / "f.png")
 
     result = mark_contents_missing_outside_prefixes(session, [str(shallow), str(shallow / "Output")])
@@ -677,7 +677,8 @@ def test_an_untouched_scan_stub_on_the_newer_duplicate_stays_retired(folders, se
     assert "missing" in fetch_record_tags(session, stub.id)
 
 
-def test_a_newer_record_with_only_a_user_tag_moves(folders, session, temp_dir):
+def test_a_newer_duplicate_with_history_keeps_the_path_over_an_older_stub(folders, session, temp_dir):
+    """The file is then listed once: the stub is retired and nothing needs moving."""
     older, newer = _duplicate_pair(folders, session, temp_dir)
     record = _record_of(session, newer.content_id)
     _tag(session, record.id, "favourite")
@@ -685,8 +686,10 @@ def test_a_newer_record_with_only_a_user_tag_moves(folders, session, temp_dir):
 
     result = mark_contents_missing_outside_prefixes(session, [str(temp_dir / "real")])
 
-    assert result.merged_records == 1
-    assert record.id in _records_on(session, older.content_id)
+    assert (result.conflict_retired, result.merged_records) == (1, 0)
+    assert _live(session, newer.content_id) == str(temp_dir / "real" / "f.png")
+    assert _live(session, older.content_id) is None
+    assert _records_on(session, newer.content_id) == {record.id}
 
 
 @pytest.mark.parametrize("edit", ["mime_type", "cleared_metadata"])
@@ -702,11 +705,28 @@ def test_a_newer_record_with_any_explicit_edit_moves(folders, session, temp_dir,
 
     result = mark_contents_missing_outside_prefixes(session, [str(temp_dir / "real")])
 
-    assert result.merged_records == 1
-    assert record.id in _records_on(session, older.content_id)
+    # Counted as history, so the newer row keeps the path over the older stub.
+    assert _live(session, newer.content_id) == str(temp_dir / "real" / "f.png")
+    assert _live(session, older.content_id) is None
+    assert result.merged_records == 0
 
 
-def test_of_two_prefixes_differing_only_in_case_the_first_registered_wins(folds_case):
+def test_case_variant_prefixes_are_offered_in_registration_order(folds_case):
     for prefixes in (["/Data/Out", "/data/out"], ["/data/out", "/Data/Out"]):
         respell = CaseRespeller(prefixes)
-        assert respell("/DATA/OUT/f.png") == (prefixes[0] + "/f.png", prefixes[0])
+        assert respell("/DATA/OUT/f.png") == tuple((prefix + "/f.png", prefix) for prefix in prefixes)
+
+
+def test_input_and_output_on_one_folder_in_two_case_spellings_stay_stable(folders, folds_case, temp_dir, session):
+    """Each row keeps the spelling of its own root, so nothing is respelled across
+    roles and later boots neither retire nor re-create anything."""
+    shared = temp_dir / "shared"
+    _populate(shared, OUTPUT_FILES)
+    folders.use(output=_case_variant(shared, temp_dir / "SHARED"), models=None, input=shared)
+    _boot()
+    before = _records(session)
+
+    for _ in range(2):
+        assert _boot() == 0
+        assert _records(session) == before
+        assert _missing_count(session) == 0

@@ -75,14 +75,16 @@ class PruneRow(NamedTuple):
 
 class RespelledRow(NamedTuple):
     row: PruneRow
-    new_path: str
-    prefix: str  # the owning prefix, as spelled today
+    # (new path, owning prefix) for each registered spelling of the row's folder
+    spellings: tuple[tuple[str, str], ...]
 
 
 class Move(NamedTuple):
     row: PruneRow
     candidates: tuple[str, ...]  # the same file under owned folders, deepest first
-    check_role: bool  # take the first candidate in the row's own role
+    # With no candidate in the row's own role: leave the row as it is (it passes the
+    # text match) rather than retire it.
+    keep_if_unfit: bool = False
 
 
 class PrunePlan(NamedTuple):
@@ -92,35 +94,37 @@ class PrunePlan(NamedTuple):
 
 
 class CaseRespeller:
-    """Maps a path to its folder part in the spelling of the deepest prefix it lies
-    under by the platform's case rules. Pure string; plan_prune confirms the two
-    spellings are one folder before acting on it. The prefixes are normalised once,
-    since the prune calls this for every live row."""
+    """Maps a path to its folder part in each registered spelling of the deepest
+    prefix it lies under by the platform's case rules. Pure string; plan_prune
+    confirms the spellings are one folder, and apply_prune_plan picks the one in the
+    row's own role. The prefixes are normalised once, since the prune calls this for
+    every live row."""
 
     def __init__(self, prefixes: Sequence[str]):
-        stems: list[tuple[str, str, str]] = []
-        seen: set[str] = set()
-        # Registration order, not a set: of two prefixes that differ only in case, the
-        # first registered wins every launch, rather than the rows flipping between them.
+        # Registration order, not a set, so the choice among spellings is the same
+        # every launch rather than the rows flipping between them. One folder can be
+        # registered under two case spellings in two roles (input and output, say).
+        spellings: dict[str, list[str]] = {}
         for prefix in dict.fromkeys(os.path.abspath(p) for p in prefixes):
             folded = os.path.normcase(prefix)
-            if len(folded) != len(prefix) or folded in seen:  # a length change: no safe splice
-                continue
-            seen.add(folded)
-            stem = folded if folded.endswith(os.sep) else folded + os.sep
-            stems.append((prefix, folded, stem))
+            if len(folded) == len(prefix):  # a length change: no safe splice
+                spellings.setdefault(folded, []).append(prefix)
+        stems = [
+            (folded, folded if folded.endswith(os.sep) else folded + os.sep, tuple(registered))
+            for folded, registered in spellings.items()
+        ]
         stems.sort(key=lambda entry: len(entry[0]), reverse=True)
         self._stems = stems
         self.folds_case = os.path.normcase("A") != "A"
 
-    def __call__(self, path: str) -> tuple[str, str] | None:
-        """(``path`` respelled, the prefix it lies under), or None when no prefix
-        contains it. Deepest prefix first, so a row exactly under a shallow prefix is
-        still respelled for a deeper one."""
+    def __call__(self, path: str) -> tuple[tuple[str, str], ...] | None:
+        """(``path`` respelled, the prefix) for every spelling of the deepest prefix
+        that contains it, or None when none does. Deepest first, so a row exactly under
+        a shallow prefix is still respelled for a deeper one."""
         candidate = os.path.normcase(path)
-        for prefix, folded, stem in self._stems:
+        for folded, stem, registered in self._stems:
             if candidate == folded or candidate.startswith(stem):
-                return prefix + path[len(prefix):], prefix
+                return tuple((prefix + path[len(prefix):], prefix) for prefix in registered)
         return None
 
 
@@ -340,22 +344,22 @@ def plan_prune(
     watchdog = _Watchdog()
     unowned = list(unowned)
 
-    by_spelling: dict[tuple[str, str], list[RespelledRow]] = {}
-    for respelled_row in respelled:
-        stored = respelled_row.row.path[:len(respelled_row.prefix)]
-        by_spelling.setdefault((stored, respelled_row.prefix), []).append(respelled_row)
-    spellings = list(by_spelling)
-    verdicts = watchdog.run([lambda pair=pair: resolver.same_folder(*pair) for pair in spellings])
-    for pair, same in zip(spellings, verdicts):
-        for respelled_row in by_spelling[pair]:
-            if same is True:
-                moves.append(Move(respelled_row.row, (respelled_row.new_path,), check_role=False))
-            elif same is False:
-                # A case-sensitive directory: another folder that differs only in case.
-                # Treat the row as unowned; a real alias can still claim it.
-                unowned.append(respelled_row.row)
-            # Undecided (a stat failed or stalled, or no inode numbers): leave the row as
-            # it is, as the prune did before re-spelling existed.
+    respelled = list(respelled)
+    pairs = list(dict.fromkeys(
+        (row.path[:len(prefix)], prefix) for row, spellings in respelled for _, prefix in spellings
+    ))
+    verdicts = dict(zip(pairs, watchdog.run([lambda pair=pair: resolver.same_folder(*pair) for pair in pairs])))
+    for row, spellings in respelled:
+        same = [verdicts[(row.path[:len(prefix)], prefix)] for _, prefix in spellings]
+        confirmed = tuple(new_path for (new_path, _), verdict in zip(spellings, same) if verdict is True)
+        if confirmed:
+            moves.append(Move(row, confirmed, keep_if_unfit=True))
+        elif all(verdict is False for verdict in same):
+            # A case-sensitive directory: another folder that differs only in case.
+            # Treat the row as unowned; a real alias can still claim it.
+            unowned.append(row)
+        # Undecided (a stat failed or stalled, or no inode numbers): leave the row as
+        # it is, as the prune did before re-spelling existed.
 
     by_parent: dict[str, list[PruneRow]] = {}
     for row in unowned:
@@ -368,7 +372,7 @@ def plan_prune(
             continue
         for outcome in outcomes:
             if outcome.candidates:
-                moves.append(Move(outcome.row, outcome.candidates, check_role=True))
+                moves.append(Move(outcome.row, outcome.candidates))
             else:
                 retire.append(outcome.row.content_id)
                 still_present += outcome.present
@@ -447,16 +451,15 @@ class _RoleDeriver:
         )
 
 
-def _move_records_with_history(
-    session: Session, kept_for: dict[str, tuple[str, str]], role_of: _RoleDeriver
-) -> int:
-    """Re-point the records of each retired duplicate that carry history onto the
-    content that keeps the path. Nothing is merged field by field: a content may
-    hold several records (a cached output adds one per delivery), and each keeps its
-    own name, tags, job and metadata. An untouched scan stub stays behind, so the
-    file is not listed twice for nothing."""
-    moved = 0
-    for chunk in _batches(list(kept_for)):
+def _record_history(
+    session: Session, path_of: dict[str, str], role_of: _RoleDeriver
+) -> dict[str, list[tuple[str, bool]]]:
+    """For each content, its records as (record id, carries history). History is
+    anything a scan would not have produced at ``path_of[content]``: a job, user
+    metadata (even {}), a preview, a rename, a tag beyond the path-derived ones, or
+    any other explicit edit (updated_at moved)."""
+    history: dict[str, list[tuple[str, bool]]] = {content_id: [] for content_id in path_of}
+    for chunk in _batches(list(path_of)):
         records = session.execute(
             sa.select(
                 Asset.id,
@@ -476,7 +479,7 @@ def _move_records_with_history(
             ):
                 tags.setdefault(record_id, set()).add(tag_name)
         for record in records:
-            winner_id, path = kept_for[record.content_id]
+            path = path_of[record.content_id]
             derived = role_of(path)
             derived_tags = derived[0] if derived is not None else frozenset()
             has_history = (
@@ -487,10 +490,8 @@ def _move_records_with_history(
                 or record.name != os.path.basename(path)
                 or bool(tags.get(record.id, set()) - derived_tags)
             )
-            if has_history:
-                session.execute(sa.update(Asset).where(Asset.id == record.id).values(content_id=winner_id))
-                moved += 1
-    return moved
+            history[record.content_id].append((record.id, has_history))
+    return history
 
 
 def _live_occupants(session: Session, paths: Sequence[str]) -> dict[str, PruneRow]:
@@ -533,44 +534,67 @@ def apply_prune_plan(session: Session, plan: PrunePlan) -> PruneResult:
     A row re-homes to its first candidate in its own role, or is retired if it has
     none. Where a new path is already held by a live row (a duplicate made under
     another spelling), or two rows move to one path, the oldest row keeps it and the
-    others are retired: marked missing, never deleted. Records on a retired
-    duplicate that carry history (a job, user metadata, a preview, a rename, a tag
-    of their own) move to the kept row first; only untouched scan stubs stay behind.
+    others are retired: marked missing, never deleted. A row whose records carry
+    history wins over one with only untouched scan stubs. Records on a retired
+    duplicate that carry history move to the kept row first; only untouched stubs
+    stay behind.
     """
     retire = list(plan.retire)
     still_present = plan.still_present
-    roles = _record_roles(session, [move.row.content_id for move in plan.moves if move.check_role])
+    roles = _record_roles(session, [move.row.content_id for move in plan.moves])
     role_of = _RoleDeriver()
     by_target: dict[str, list[PruneRow]] = {}
     for move in plan.moves:
-        if move.check_role:
-            records = roles.get(move.row.content_id, ())
-            target = next((path for path in move.candidates if role_of.fits(path, records)), None)
-        else:
-            target = move.candidates[0]
+        records = roles.get(move.row.content_id, ())
+        target = next((path for path in move.candidates if role_of.fits(path, records)), None)
         if target is None:
+            if move.keep_if_unfit:
+                continue
             retire.append(move.row.content_id)
             still_present += 1
             continue
         by_target.setdefault(os.path.abspath(target), []).append(move.row)
 
     occupants = _live_occupants(session, list(by_target))
+    contested = {
+        new_path: rows if new_path not in occupants else [*rows, occupants[new_path]]
+        for new_path, rows in by_target.items()
+    }
+    history = _record_history(
+        session,
+        {row.content_id: new_path for new_path, rows in contested.items() if len(rows) > 1 for row in rows},
+        role_of,
+    )
+
+    def has_history(row: PruneRow) -> bool:
+        return any(carries for _, carries in history.get(row.content_id, ()))
+
     rewrites: list[dict[str, str]] = []
     losers: list[str] = []
-    kept_for: dict[str, tuple[str, str]] = {}  # loser content id -> (winner content id, path)
-    for new_path, rows in by_target.items():
+    moved_records: list[dict[str, str]] = []
+    for new_path, contenders in contested.items():
         occupant = occupants.get(new_path)
-        contenders = rows if occupant is None else [*rows, occupant]
-        winner = min(contenders, key=lambda row: (row.created_at, row.content_id))
+        # A row carrying history keeps the path over an untouched stub, then the oldest,
+        # so a healed file is listed once.
+        winner = min(contenders, key=lambda row: (not has_history(row), row.created_at, row.content_id))
         for row in contenders:
-            if row is not winner:
-                losers.append(row.content_id)
-                kept_for[row.content_id] = (winner.content_id, new_path)
+            if row is winner:
+                continue
+            losers.append(row.content_id)
+            # Nothing is merged field by field: a content may hold several records (a
+            # cached output adds one per delivery), and each keeps its own fields. An
+            # untouched stub stays on the retired row, so the file is not listed twice.
+            moved_records.extend(
+                {"id": record_id, "content_id": winner.content_id}
+                for record_id, carries in history.get(row.content_id, ())
+                if carries
+            )
         if winner is not occupant:
             rewrites.append({"id": winner.content_id, "path": new_path})
 
     # Before retiring, so the records that move are not tagged missing with the rest.
-    merged = _move_records_with_history(session, kept_for, role_of)
+    for chunk in _batches(moved_records):
+        session.execute(sa.update(Asset), list(chunk))
     # Retire first: a loser may hold the path its winner is about to take.
     for content_id in [*retire, *losers]:
         mark_content_missing(session, content_id)
@@ -581,5 +605,5 @@ def apply_prune_plan(session: Session, plan: PrunePlan) -> PruneResult:
         rehomed=rehomed,
         still_present=still_present,
         conflict_retired=len(losers),
-        merged_records=merged,
+        merged_records=len(moved_records),
     )
