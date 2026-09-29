@@ -51,19 +51,37 @@ class PrunePlan(NamedTuple):
     still_present: int
 
 
-def respell_case(path: str, prefixes: Sequence[str]) -> str | None:
-    """``path`` with its folder part in the spelling of the deepest prefix it lies
-    under by the platform's case rules, or None when there is none. Pure string:
-    the prune already treats a normcase match as the same folder."""
-    candidate = os.path.normcase(path)
-    for prefix in sorted((os.path.abspath(p) for p in prefixes), key=len, reverse=True):
-        folded = os.path.normcase(prefix)
-        if len(folded) != len(prefix):  # case mapping changed the length: no safe splice
-            continue
-        stem = folded if folded.endswith(os.sep) else folded + os.sep
-        if candidate == folded or candidate.startswith(stem):
-            return prefix + path[len(prefix):]
-    return None
+class RespelledRow(NamedTuple):
+    row: PruneRow
+    new_path: str
+
+
+class CaseRespeller:
+    """Maps a path to its folder part in the spelling of the deepest prefix it lies
+    under by the platform's case rules. Pure string: the prune already treats a
+    normcase match as the same folder. The prefixes are normalised once, since the
+    prune calls this for every live row."""
+
+    def __init__(self, prefixes: Sequence[str]):
+        stems: list[tuple[str, str, str]] = []
+        for prefix in {os.path.abspath(p) for p in prefixes}:
+            folded = os.path.normcase(prefix)
+            if len(folded) != len(prefix):  # case mapping changed the length: no safe splice
+                continue
+            stem = folded if folded.endswith(os.sep) else folded + os.sep
+            stems.append((prefix, folded, stem))
+        stems.sort(key=lambda entry: len(entry[0]), reverse=True)
+        self._stems = stems
+        self.folds_case = os.path.normcase("A") != "A"
+
+    def __call__(self, path: str) -> str | None:
+        """``path`` respelled, or None when no prefix contains it. Deepest prefix first,
+        so a row exactly under a shallow prefix is still respelled for a deeper one."""
+        candidate = os.path.normcase(path)
+        for prefix, folded, stem in self._stems:
+            if candidate == folded or candidate.startswith(stem):
+                return prefix + path[len(prefix):]
+        return None
 
 
 def _stat_or_none(path: str) -> os.stat_result | None:
@@ -131,22 +149,19 @@ class _FolderResolver:
 
 
 def plan_prune(
-    respelled: Iterable[PruneRow],
+    respelled: Iterable[RespelledRow],
     unowned: Iterable[PruneRow],
     prefixes: Sequence[str],
 ) -> PrunePlan:
     """Decide each row's fate with filesystem reads only; nothing is written.
 
     ``respelled`` rows are owned by case-folded text but spelled differently from
-    every prefix. ``unowned`` rows fail the text match altogether.
+    their deepest prefix, already paired with CaseRespeller's path. ``unowned`` rows
+    fail the text match altogether.
     """
-    moves: list[tuple[PruneRow, str]] = []
+    moves: list[tuple[PruneRow, str]] = [(r.row, r.new_path) for r in respelled]
     retire: list[str] = []
     still_present = 0
-    for row in respelled:
-        new_path = respell_case(row.path, prefixes)
-        if new_path is not None and new_path != row.path:
-            moves.append((row, new_path))
 
     resolver = _FolderResolver(prefixes)
     for row in unowned:
@@ -198,7 +213,7 @@ def apply_prune_plan(session: Session, plan: PrunePlan) -> PruneResult:
         winner = min(contenders, key=lambda row: (row.created_at, row.content_id))
         losers.extend(row.content_id for row in contenders if row is not winner)
         if winner is not occupant:
-            rewrites.append({"id": winner.content_id, "path": new_path})
+            rewrites.append({"id": winner.content_id, "path": os.path.abspath(new_path)})
 
     # Retire first: a loser may hold the path its winner is about to take.
     for content_id in [*plan.retire, *losers]:

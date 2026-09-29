@@ -114,6 +114,8 @@ A folder can be registered under a different spelling of the same location: lett
 
 If a live row already holds the new path, the oldest row keeps it and the others are marked missing. This happens with duplicates left by an earlier case-only relaunch.
 
+A re-homed row keeps the tags it was given when it was first catalogued, as a row whose spelling never changed does, even if the folder now plays a different role. Case-only rewrites don't check that the file exists; the per-root sync that follows retires the row if it doesn't.
+
 ### Partial download under its final filename
 
 The scanner skips known partial-download extensions. For other files, it records file facts during the walk, waits once per scan pass for a short stability floor, and checks the facts again before inserting.

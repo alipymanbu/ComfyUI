@@ -20,12 +20,13 @@ from app.assets import seeder as seeder_module
 from app.assets.database.models import Asset, AssetContent
 from app.assets.database.queries.records import create_content, create_record
 from app.assets.scanner_admission import _WATCH_LIST
+from app.assets.scanner import mark_contents_missing_outside_prefixes
 from app.assets.scanner_rehome import (
+    CaseRespeller,
     PrunePlan,
     PruneRow,
     apply_prune_plan,
     plan_prune,
-    respell_case,
 )
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="builds symlinks and simulates case folding on POSIX")
@@ -366,9 +367,29 @@ def test_of_two_aliases_for_one_file_the_older_row_moves(session, temp_dir):
     assert _live(session, newer.content_id) is None
 
 
-def test_respell_case_uses_the_deepest_matching_prefix(folds_case):
-    prefixes = ["/Data", "/Data/Output"]
+def test_case_respelling_uses_the_deepest_matching_prefix(folds_case):
+    respell = CaseRespeller(["/Data", "/Data/Output"])
 
-    assert respell_case("/data/output/sub/F.png", prefixes) == "/Data/Output/sub/F.png"
-    assert respell_case("/data/other/F.png", prefixes) == "/Data/other/F.png"
-    assert respell_case("/elsewhere/F.png", prefixes) is None
+    assert respell("/data/output/sub/F.png") == "/Data/Output/sub/F.png"
+    assert respell("/data/other/F.png") == "/Data/other/F.png"
+    assert respell("/elsewhere/F.png") is None
+
+
+def test_a_row_spelled_for_a_shallow_prefix_is_respelled_for_a_deeper_one(folds_case, session, temp_dir):
+    shallow = temp_dir / "models"
+    row = _row(session, shallow / "output" / "f.png")
+
+    result = mark_contents_missing_outside_prefixes(session, [str(shallow), str(shallow / "Output")])
+
+    assert (result.marked, result.rehomed) == (0, 1)
+    assert _live(session, row.content_id) == str(shallow / "Output" / "f.png")
+
+
+def test_without_case_folding_owned_rows_are_left_alone(session, temp_dir):
+    shallow = temp_dir / "models"
+    row = _row(session, shallow / "output" / "f.png")
+
+    result = mark_contents_missing_outside_prefixes(session, [str(shallow), str(shallow / "Output")])
+
+    assert (result.marked, result.rehomed) == (0, 0)
+    assert _live(session, row.content_id) == str(shallow / "output" / "f.png")

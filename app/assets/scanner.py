@@ -39,8 +39,10 @@ from app.assets.scanner_changes import (
     recover_missing_content,
 )
 from app.assets.scanner_rehome import (
+    CaseRespeller,
     PruneResult,
     PruneRow,
+    RespelledRow,
     apply_prune_plan,
     plan_prune,
 )
@@ -319,14 +321,16 @@ def mark_contents_missing_outside_prefixes(
         .execution_options(yield_per=500)
     )
     is_owned = path_prefix_matcher(prefixes)
-    is_spelled = path_prefix_matcher(prefixes, fold_case=False)
-    respelled: list[PruneRow] = []
+    respell = CaseRespeller(prefixes)
+    respelled: list[RespelledRow] = []
     unowned: list[PruneRow] = []
     for content_id, path, created_at in rows:
         if not is_owned(path):
             unowned.append(PruneRow(content_id, path, created_at))
-        elif not is_spelled(path):
-            respelled.append(PruneRow(content_id, path, created_at))
+        elif respell.folds_case:
+            new_path = respell(path)
+            if new_path is not None and new_path != path:
+                respelled.append(RespelledRow(PruneRow(content_id, path, created_at), new_path))
     # The plan only reads the filesystem, so no write is pending while it stats.
     plan = plan_prune(respelled, unowned, prefixes)
     return apply_prune_plan(session, plan)
