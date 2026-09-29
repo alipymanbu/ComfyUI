@@ -42,6 +42,7 @@ from comfy_execution.graph import (
 from comfy_execution.graph_utils import GraphBuilder, is_link
 from comfy_execution.validation import LoopValidationError, validate_loops, validate_node_input
 from comfy_execution.progress import get_progress_state, reset_progress_state, add_progress_handler, WebUIProgressHandler
+from comfy_execution.benchmark import BenchmarkSession
 from comfy_execution.utils import CurrentNodeContext
 from comfy_execution.asset_enrichment import register_executed_outputs, emit_cached_output
 from comfy_api.internal import _ComfyNodeInternal, _NodeOutputInternal, first_real_override, is_class, make_locked_method_func
@@ -741,6 +742,10 @@ class PromptExecutor:
         self.status_messages = []
         self.add_message("execution_start", { "prompt_id": prompt_id}, broadcast=False)
 
+        # Opt-in benchmark capture (extra_data["benchmark"] or --benchmark). Returns
+        # None and costs nothing when disabled.
+        benchmark = BenchmarkSession.maybe_start(extra_data)
+
         self._notify_prompt_lifecycle("start", prompt_id)
         ram_headroom = int(self.cache_args["ram"] * (1024 ** 3))
         ram_inactive_headroom = int(self.cache_args["ram_inactive"] * (1024 ** 3))
@@ -786,7 +791,17 @@ class PromptExecutor:
                         break
 
                     assert node_id is not None, "Node ID should not be None at this point"
+                    if benchmark is not None:
+                        benchmark.node_start(node_id)
                     result, error, ex = await execute(self.server, dynamic_prompt, self.caches, node_id, extra_data, executed, prompt_id, execution_list, pending_subgraph_results, pending_async_nodes, ui_node_outputs, self.asset_manager)
+                    if benchmark is not None:
+                        class_type = None
+                        try:
+                            node = dynamic_prompt.get_node(node_id)
+                            class_type = node.get("class_type") if isinstance(node, dict) else None
+                        except Exception:
+                            pass
+                        benchmark.node_end(node_id, class_type)
                     self.success = result != ExecutionResult.FAILURE
                     if result == ExecutionResult.FAILURE:
                         self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed, error, ex)
@@ -836,6 +851,8 @@ class PromptExecutor:
                 if comfy.model_management.DISABLE_SMART_MEMORY:
                     comfy.model_management.unload_all_models()
         finally:
+            if benchmark is not None:
+                benchmark.finish(self.server, prompt_id)
             if self.cache_type == CacheType.RAM_PRESSURE:
                 detail("RAM cache evictions: prompt=%s active=%s full=%s", prompt_id, self.caches.outputs.active_evictions, self.caches.outputs.full_evictions)
             comfy.memory_management.set_ram_cache_release_state(None, 0)
