@@ -88,6 +88,14 @@ def _alias(target: Path, link: Path) -> Path:
     return link
 
 
+def _case_variant(target: Path, variant: Path) -> Path:
+    """``variant`` (``target`` in other letter case) reaching ``target``: as-is on a
+    case-insensitive filesystem (macOS by default), through a symlink elsewhere."""
+    if variant.exists():
+        return variant
+    return _alias(target, variant)
+
+
 def _boot(caplog: pytest.LogCaptureFixture | None = None) -> int:
     """One startup: the prune, then the fast phase. Returns the rows it created."""
     seeder = seeder_module._AssetSeeder()
@@ -222,7 +230,7 @@ def folds_case(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_a_case_only_respelling_neither_duplicates_nor_retires(folders, folds_case, temp_dir, session, caplog):
     real = temp_dir / "data" / "output"
     _populate(real, OUTPUT_FILES)
-    upper = _alias(temp_dir / "data", temp_dir / "DATA") / "output"
+    upper = _case_variant(temp_dir / "data", temp_dir / "DATA") / "output"
     folders.use(output=upper, models=None)
     _boot()
     _rename_all(session)
@@ -239,7 +247,7 @@ def test_a_case_only_respelling_neither_duplicates_nor_retires(folders, folds_ca
 def test_existing_case_duplicates_heal_keeping_the_older_row(folders, folds_case, temp_dir, session, caplog):
     real = temp_dir / "data" / "output"
     _populate(real, OUTPUT_FILES)
-    upper = _alias(temp_dir / "data", temp_dir / "DATA") / "output"
+    upper = _case_variant(temp_dir / "data", temp_dir / "DATA") / "output"
     folders.use(output=upper, models=None)
     _boot()
     _rename_all(session)
