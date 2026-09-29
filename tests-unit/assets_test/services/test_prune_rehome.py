@@ -6,6 +6,8 @@ fast phase, on an in-memory catalog."""
 import logging
 import os
 import posixpath
+import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -16,7 +18,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Session as SASession, sessionmaker
 
 import folder_paths
-from app.assets import seeder as seeder_module
+from app.assets import scanner_rehome, seeder as seeder_module
 from app.assets.database.models import Asset, AssetContent
 from app.assets.database.queries.records import create_content, create_record
 from app.assets.scanner_admission import _WATCH_LIST
@@ -63,7 +65,9 @@ class Folders:
         monkeypatch.setattr(folder_paths, "get_temp_directory", lambda: str(temp_dir / "temp"))
         self.use(output=None, models=None)
 
-    def use(self, *, output: Path | None, models: Path | None) -> None:
+    def use(self, *, output: Path | None, models: Path | None, input: Path | None = None) -> None:
+        input_dir = str(input if input is not None else self.base / "input")
+        self._monkeypatch.setattr(folder_paths, "get_input_directory", lambda: input_dir)
         output_dir = str(output if output is not None else self.base / "no-output")
         self._monkeypatch.setattr(folder_paths, "get_output_directory", lambda: output_dir)
         registered = {} if models is None else {"checkpoints": ([str(models)], {".safetensors"})}
@@ -276,9 +280,10 @@ T0 = datetime(2026, 1, 1)
 
 
 def _row(session, path: Path, age_days: int = 0) -> PruneRow:
+    """A row catalogued as an output file directly under the output folder."""
     content = create_content(session, path=str(path), size_bytes=1, mtime_ns=1)
     content.created_at = T0 + timedelta(days=age_days)
-    create_record(session, content_id=content.id, name=path.name)
+    create_record(session, content_id=content.id, name=path.name, loader_path=path.name, tags=["output"])
     session.flush()
     return PruneRow(content.id, content.path, content.created_at)
 
@@ -348,9 +353,10 @@ def test_a_filesystem_without_inode_numbers_is_never_rehomed(session, temp_dir, 
     assert plan_prune([], [row], [str(real)]) == PrunePlan([], [row.content_id], 1)
 
 
-def test_an_older_live_row_at_the_new_path_keeps_it(session, temp_dir):
+def test_an_older_live_row_at_the_new_path_keeps_it(folders, session, temp_dir):
     real = temp_dir / "real"
     _populate(real, ("f.png",))
+    folders.use(output=real, models=None)
     alias = _alias(real, temp_dir / "alias")
     occupant = _row(session, real / "f.png", age_days=0)
     mover = _row(session, alias / "f.png", age_days=1)
@@ -362,9 +368,10 @@ def test_an_older_live_row_at_the_new_path_keeps_it(session, temp_dir):
     assert _live(session, mover.content_id) is None
 
 
-def test_of_two_aliases_for_one_file_the_older_row_moves(session, temp_dir):
+def test_of_two_aliases_for_one_file_the_older_row_moves(folders, session, temp_dir):
     real = temp_dir / "real"
     _populate(real, ("f.png",))
+    folders.use(output=real, models=None)
     newer = _row(session, _alias(real, temp_dir / "a1") / "f.png", age_days=2)
     older = _row(session, _alias(real, temp_dir / "a2") / "f.png", age_days=1)
 
@@ -476,3 +483,126 @@ def test_an_unreachable_folder_is_probed_once_then_never_again(session, temp_dir
     assert first_probes == 1  # the shared parent, once
     assert second == (0, 0, 0, 0)
     assert len(probed) == first_probes
+
+
+# --- QA findings: hung mounts, different files, the row's own root, racing writers ----
+
+def test_a_hung_mount_costs_a_bounded_wait_not_the_seeder(folders, session, temp_dir, monkeypatch):
+    real = temp_dir / "real"
+    _populate(real, ("ok.png",))
+    folders.use(output=real, models=None)
+    kept = _row(session, _alias(real, temp_dir / "alias") / "ok.png")
+    hung = [_row(session, temp_dir / "dead" / d / "f.png") for d in ("a", "b")]
+    monkeypatch.setattr(scanner_rehome, "STALL_SECONDS", 0.2)
+    release = threading.Event()
+    real_stat = os.stat
+
+    def hard_mount(path, *args, **kwargs):
+        if os.fspath(path).startswith(str(temp_dir / "dead")):
+            release.wait(30)
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", hard_mount)
+    try:
+        started = time.monotonic()
+        result = mark_contents_missing_outside_prefixes(session, [str(real)])
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+
+    assert elapsed < 5
+    assert (result.marked, result.rehomed, result.still_present) == (2, 1, 0)
+    assert [_live(session, row.content_id) for row in hung] == [None, None]
+    assert _live(session, kept.content_id) == str(real / "ok.png")
+
+
+def test_a_different_file_behind_the_same_folder_is_not_rehomed(folders, session, temp_dir, monkeypatch):
+    """A relative ../ symlink inside a bind-mounted folder names a different file under
+    each spelling, though the folders compare equal. Simulated: the new path stats as
+    another file."""
+    real = temp_dir / "real"
+    _populate(real, ("f.png",))
+    _populate(temp_dir / "stranger", ("f.png",))
+    folders.use(output=real, models=None)
+    row = _row(session, _alias(real, temp_dir / "alias") / "f.png")
+    real_stat = os.stat
+
+    def other_file(path, *args, **kwargs):
+        if os.fspath(path) == str(real / "f.png"):
+            return real_stat(temp_dir / "stranger" / "f.png")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", other_file)
+
+    result = mark_contents_missing_outside_prefixes(session, [str(real)])
+
+    assert (result.marked, result.rehomed, result.still_present) == (1, 0, 1)
+    assert _live(session, row.content_id) is None
+
+
+def test_a_model_folder_inside_the_output_folder_keeps_output_rows_as_output(folders, temp_dir, session):
+    out = temp_dir / "real" / "out"
+    _populate(out, ("checkpoints/m.safetensors", "a.png"))
+    folders.use(output=_alias(temp_dir / "real", temp_dir / "A") / "out", models=None)
+    _boot()
+    _rename_all(session)
+    before = _records(session)
+    checkpoints = _alias(out / "checkpoints", temp_dir / "L")
+
+    folders.use(output=out, models=checkpoints)
+    _boot()
+
+    after = _records(session)
+    for record_id, (path, name) in before.items():
+        assert after[record_id] == (path.replace(str(temp_dir / "A" / "out"), str(out)), name)
+    session.expire_all()
+    records = session.scalars(sa.select(Asset).where(Asset.id.in_(before))).all()
+    assert {record.loader_path for record in records} == {"checkpoints/m.safetensors", "a.png"}
+
+
+def test_input_and_output_on_one_folder_keep_each_row_in_its_own_root(folders, temp_dir, session):
+    shared = temp_dir / "shared"
+    _populate(shared, ("f.png",))
+    folders.use(output=_alias(shared, temp_dir / "X1"), models=None)
+    _boot()
+    _rename_all(session)
+    (record_id,) = _records(session)
+
+    folders.use(output=shared, models=None, input=_alias(shared, temp_dir / "Y"))
+    _boot()
+
+    assert _records(session)[record_id][0] == str(shared / "f.png")
+
+
+def test_a_row_whose_folder_now_has_only_another_role_is_retired(folders, temp_dir, session, caplog):
+    out = temp_dir / "real" / "out"
+    _populate(out, ("m.safetensors",))
+    folders.use(output=_alias(temp_dir / "real", temp_dir / "A") / "out", models=None)
+    _boot()
+    old_ids = set(_records(session))
+
+    folders.use(output=None, models=_alias(out, temp_dir / "L"))
+    _boot(caplog)
+
+    assert not old_ids & set(_records(session))
+    event = _marked_missing_event(caplog)
+    assert (event["rehomed_count"], event["still_present_count"]) == ("0", "1")
+
+
+def test_a_target_taken_by_a_racing_writer_skips_that_row_only(folders, session, temp_dir, monkeypatch):
+    real = temp_dir / "real"
+    _populate(real, ("f.png", "g.png"))
+    folders.use(output=real, models=None)
+    alias = _alias(real, temp_dir / "alias")
+    raced = _row(session, alias / "f.png")
+    moved = _row(session, alias / "g.png")
+    racer = _row(session, real / "f.png", age_days=5)
+    # The racer's insert lands between the occupant read and the rewrite.
+    monkeypatch.setattr(scanner_rehome, "_live_occupants", lambda _session, _paths: {})
+
+    result = mark_contents_missing_outside_prefixes(session, [str(real)])
+
+    assert (result.marked, result.rehomed) == (0, 1)
+    assert _live(session, raced.content_id) == str(alias / "f.png")
+    assert _live(session, moved.content_id) == str(real / "g.png")
+    assert _live(session, racer.content_id) == str(real / "f.png")
